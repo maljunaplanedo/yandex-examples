@@ -1,0 +1,24 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/msatskevich/Desktop/Residue/main.cpp
+iostream
+-
+residue.h
+/home/msatskevich/Desktop/Residue/residue.h
+
+/home/msatskevich/Desktop/Residue/residue.h
+iostream
+-
+algorithm
+-
+vector
+-
+cassert
+-
+
