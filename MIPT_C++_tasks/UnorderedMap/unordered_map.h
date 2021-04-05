@@ -8,131 +8,6 @@
 #include <chrono>
 #include <list>
 
-namespace Helpers {
-
-    template<typename T, bool isConst>
-    struct ConstHanger {
-        using type = T;
-    };
-
-    template<typename T>
-    struct ConstHanger<T, true> {
-        using type = const T;
-    };
-
-
-} // namespace Helpers
-
-template<size_t chunkSize>
-class FixedAllocator {
-private:
-    char* pool = new char[POOL_SIZE];
-    size_t next = 0;
-
-    static const size_t POOL_SIZE = (1u << 27);
-
-public:
-    FixedAllocator() = default;
-
-    ~FixedAllocator() {
-        delete[] pool;
-    }
-
-    FixedAllocator(const FixedAllocator& other) = delete;
-
-    FixedAllocator& operator=(const FixedAllocator& other) = delete;
-
-    bool isInside(void* pointer) {
-        return pool <= pointer && pointer < pool + POOL_SIZE;
-    }
-
-    void* allocate(size_t neededSize) {
-        // pool size check is missing to increase performance
-        size_t byteNeededSize = neededSize * chunkSize;
-        next += byteNeededSize;
-        return static_cast<void*>(pool + (next - byteNeededSize));
-    }
-
-    void deallocate(void* pointer, size_t count) {  pointer = pointer; count = count;  }
-};
-
-
-template<typename T>
-class FastAllocator {
-
-    template<typename U>
-    friend class FastAllocator;
-
-private:
-    static const size_t CHUNK_SIZE = 1;
-    static const size_t MAX_FIXED_ALLOCATION_SIZE = 128;
-
-    using FixedAlloc = FixedAllocator<CHUNK_SIZE>;
-
-    std::shared_ptr<FixedAlloc> fixedAlloc =
-            std::make_shared<FixedAlloc>();
-
-
-public:
-    using value_type = T;
-
-    FastAllocator() = default;
-
-    ~FastAllocator() = default;
-
-    template<typename U>
-    FastAllocator(const FastAllocator<U>& other)
-        :fixedAlloc(other.fixedAlloc)
-    {   }
-
-    template<typename U>
-    FastAllocator(FastAllocator<U>&& other)
-        :fixedAlloc(other.fixedAlloc) {
-
-        other.fixedAlloc.reset();
-    }
-
-    void swap(FastAllocator& other) {
-        std::swap(fixedAlloc, other.fixedAlloc);
-    }
-
-    FastAllocator& operator=(const FastAllocator& other) {
-        FastAllocator copy(other);
-        swap(copy);
-        return *this;
-    }
-
-    FastAllocator& operator=(FastAllocator&& other) noexcept {
-        FastAllocator temp(std::move(other));
-        swap(temp);
-        return *this;
-    }
-
-    value_type* allocate(size_t count) {
-        size_t neededSize = count * sizeof(T);
-        if (neededSize <= MAX_FIXED_ALLOCATION_SIZE)
-            return reinterpret_cast<T*>(fixedAlloc->allocate(neededSize));
-        return reinterpret_cast<T*>(::operator new(neededSize));
-    }
-
-    void deallocate(value_type* pointer, size_t count) {
-        void* castPointer = reinterpret_cast<void*>(pointer);
-        if (fixedAlloc->isInside(castPointer))
-            fixedAlloc->deallocate(castPointer, count);
-        else
-            ::operator delete(castPointer);
-    }
-
-    bool operator==(const FastAllocator& other) const {
-        return fixedAlloc == other.fixedAlloc;
-    }
-
-    bool operator!=(const FastAllocator& other) const {
-        return !(*this == other);
-    }
-
-};
-
 
 template<typename T, typename Allocator = std::allocator<T>>
 class List {
@@ -142,25 +17,44 @@ private:
 
 public:
     struct Node {
-        T value;
+        Allocator alloc;
 
+        T* value = nullptr;
         Node* prev = nullptr;
         Node* next = nullptr;
 
         Node() = default;
 
-        explicit Node(const T& value)
-                :value(value)
-        {   }
+        void allocateValue() {
+            value = AllocTraits::allocate(this->alloc, 1);
+        }
 
-        explicit Node(T&& value)
-            :value(std::move(value))
-        {   }
+        explicit Node(const Allocator& alloc, const T& element)
+                :alloc(alloc) {
+
+            allocateValue();
+            AllocTraits::construct(this->alloc, value, element);
+        }
+
+        explicit Node(const Allocator& alloc, T&& element):
+            alloc(alloc) {
+
+            allocateValue();
+            AllocTraits::construct(this->alloc, value, std::move(element));
+        }
 
         template<typename... Args>
-        explicit Node(Args&&... args)
-            :value(std::forward<Args>(args)...)
-        {   }
+        explicit Node(const Allocator& alloc, Args&&... args)
+            :alloc(alloc) {
+
+            allocateValue();
+            AllocTraits::construct(this->alloc, value, std::forward<Args>(args)...);
+        }
+
+        ~Node() {
+            AllocTraits::destroy(alloc, value);
+            AllocTraits::deallocate(alloc, value, 1);
+        }
 
     };
 
@@ -204,20 +98,20 @@ public:
 
     Node* make(const T& value) {
         Node* newNode = NodeAllocTraits::allocate(alloc, 1);
-        NodeAllocTraits::construct(alloc, newNode, value);
+        NodeAllocTraits::construct(alloc, newNode, static_cast<Allocator>(alloc), value);
         return newNode;
     }
 
     Node* make(T&& value) {
         Node* newNode = NodeAllocTraits::allocate(alloc, 1);
-        NodeAllocTraits::construct(alloc, newNode, std::move(value));
+        NodeAllocTraits::construct(alloc, newNode, static_cast<Allocator>(alloc), std::move(value));
         return newNode;
     }
 
     template<typename... Args>
     Node* make(Args&&... args) {
         Node* newNode = NodeAllocTraits::allocate(alloc, 1);
-        NodeAllocTraits::construct(alloc, newNode, std::forward<Args>(args)...);
+        NodeAllocTraits::construct(alloc, newNode, static_cast<Allocator>(alloc), std::forward<Args>(args)...);
         return newNode;
     }
 
@@ -275,7 +169,7 @@ public:
         friend class ProtoIterator;
 
     private:
-        using ValueT = typename Helpers::template ConstHanger<T, isConst>::type;
+        using ValueT = std::conditional_t<isConst, const T, T>;
 
         Node* node;
         const List* container;
@@ -322,7 +216,7 @@ public:
         ~ProtoIterator() = default;
 
         reference operator*() const {
-            return node->value;
+            return *node->value;
         }
 
         pointer operator->() const {
@@ -431,9 +325,7 @@ public:
             :List(alloc) {
 
         for (size_t i = 0; i < count; ++i) {
-            Node* newNode = NodeAllocTraits::allocate(this->alloc, 1);
-            NodeAllocTraits::construct(this->alloc, newNode);
-            insertAfter(lastNode, newNode);
+            makeAndInsertAfter(lastNode);
         }
     }
 
@@ -553,27 +445,18 @@ public:
             : List(other, AllocTraits::select_on_container_copy_construction(static_cast<Allocator>(other.alloc)))
     {   }
 
-    List(List&& other, const Allocator& alloc) noexcept
-            : List(alloc) {
-        if (this->alloc == other.alloc) {
-            firstNode = other.firstNode;
-            lastNode = other.lastNode;
-            length = other.length;
+    List(List&& other) noexcept
+            : List(other.alloc) {
 
-            other.firstNode = nullptr;
-            other.lastNode = nullptr;
-            other.length = 0;
-        } else {
-            for (auto& it: other) {
-                push_back(std::move(it));
-            }
-            other.clear();
-        }
+        firstNode = other.firstNode;
+        lastNode = other.lastNode;
+        length = other.length;
+
+        other.firstNode = nullptr;
+        other.lastNode = nullptr;
+        other.length = 0;
     }
 
-    List(List&& other) noexcept
-            :List(std::move(other), other.alloc)
-    {   }
 
     List& operator=(const List& other) {
 
@@ -592,11 +475,16 @@ public:
     }
 
     List& operator=(List&& other) noexcept {
-        NodeAlloc newAlloc = (AllocTraits::propagate_on_container_move_assignment::value ?
-                other.alloc : alloc);
+        firstNode = other.firstNode;
+        lastNode = other.lastNode;
+        length = other.length;
 
-        List temp(std::move(other), static_cast<Allocator>(newAlloc));
-        total_swap(temp);
+        other.firstNode = nullptr;
+        other.lastNode = nullptr;
+        other.length = 0;
+
+        if (AllocTraits::propagate_on_container_move_assignment::value)
+            alloc = other.alloc;
 
         return *this;
     }
@@ -621,37 +509,37 @@ private:
     using KeyValList = List<KeyValPair, Alloc>;
 
 public:
-    using Iterator = typename KeyValList::iterator;
-    using ConstIterator = typename KeyValList::const_iterator;
+    using iterator = typename KeyValList::iterator;
+    using const_iterator = typename KeyValList::const_iterator;
 
 private:
 
+    using IteratorAlloc = typename AllocTraits::template rebind_alloc<iterator>;
     using KeyValListNode = typename KeyValList::Node;
-    using BucketVector = std::vector<Iterator, Alloc>;
+    using BucketVector = std::vector<iterator, IteratorAlloc>;
 
 private:
 
     static const size_t START_BUCKET_COUNT = 4;
     constexpr static const double DEFAULT_MAX_LOAD_FACTOR = 1.0;
 
-    size_t bucketCount;
     double maxLoadFactor = DEFAULT_MAX_LOAD_FACTOR;
+    size_t bucketCount;
 
+    Hash hashFunc;
+    Equal equal;
     Alloc alloc;
 
     KeyValList keyValList;
     BucketVector bucketBegins;
     BucketVector bucketEnds;
 
-    Hash hashFunc;
-    Equal equal;
-
     [[nodiscard]] size_t getBucket(const Key& key) const {
         return hashFunc(key) % bucketCount;
     }
 
-    std::pair<Iterator, bool> insertListNode(KeyValListNode* listNode) {
-        auto it = find(listNode->value.first);
+    std::pair<iterator, bool> insertListNode(KeyValListNode* listNode) {
+        auto it = find(listNode->value->first);
         if (it != end()) {
             keyValList.destroyNode(listNode);
             return std::make_pair(it, false);
@@ -659,7 +547,7 @@ private:
 
         reserve(size() + 1);
 
-        size_t bucket = getBucket(listNode->value.first);
+        size_t bucket = getBucket(listNode->value->first);
         it = bucketBegins[bucket];
 
         auto newIt = keyValList.insertNode(it, listNode);
@@ -669,17 +557,6 @@ private:
             bucketEnds[bucket] = newIt;
 
         return std::make_pair(newIt, true);
-    }
-
-    void total_swap(UnorderedMap& other) {
-        std::swap(bucketCount, other.bucketCount);
-        std::swap(maxLoadFactor, other.maxLoadFactor);
-        std::swap(alloc, other.alloc);
-        std::swap(keyValList, other.keyValList);
-        std::swap(bucketBegins, other.bucketBegins);
-        std::swap(bucketEnds, other.bucketEnds);
-        std::swap(hashFunc, other.hashFunc);
-        std::swap(equal, other.equal);
     }
 
 
@@ -726,19 +603,15 @@ public:
                            AllocTraits::select_on_container_copy_construction(other.alloc))
     {   }
 
-    UnorderedMap(UnorderedMap&& other) noexcept
-        : UnorderedMap(std::move(other), other.alloc)
-    {   }
-
-    UnorderedMap(UnorderedMap&& other, const Alloc& alloc)
-            : bucketCount(other.bucketCount),
-              maxLoadFactor(other.maxLoadFactor),
-              alloc(alloc),
-              keyValList(std::move(other.keyValList), alloc),
-              bucketBegins(std::move(other.bucketBegins), alloc),
-              bucketEnds(std::move(other.bucketEnds), alloc),
+    UnorderedMap(UnorderedMap&& other)
+            : maxLoadFactor(other.maxLoadFactor),
+              bucketCount(other.bucketCount),
               hashFunc(std::move(other.hashFunc)),
-              equal(std::move(other.equal)) {
+              equal(std::move(other.equal)),
+              alloc(other.alloc),
+              keyValList(std::move(other.keyValList)),
+              bucketBegins(std::move(other.bucketBegins)),
+              bucketEnds(std::move(other.bucketEnds)) {
 
         other.bucketCount = 0;
     }
@@ -755,10 +628,16 @@ public:
     }
 
     UnorderedMap& operator=(UnorderedMap&& other) noexcept {
-        Alloc newAlloc = (AllocTraits::propagate_on_container_move_assignment::value ?
-                other.alloc : alloc);
-        UnorderedMap temp(std::move(other), newAlloc);
-        total_swap(temp);
+        maxLoadFactor = other.maxLoadFactor;
+        bucketCount = other.bucketCount;
+        hashFunc = std::move(other.hashFunc);
+        equal = std::move(other.equal);
+        if (AllocTraits::propagate_on_container_move_assignment::value)
+            alloc = other.alloc;
+        keyValList = std::move(other.keyValList);
+        bucketBegins = std::move(other.bucketBegins);
+        bucketEnds = std::move(other.bucketEnds);
+
         return *this;
     }
 
@@ -804,31 +683,31 @@ public:
         return keyValList.empty();
     }
 
-    [[nodiscard]] Iterator begin() {
+    [[nodiscard]] iterator begin() {
         return keyValList.begin();
     }
 
-    [[nodiscard]] ConstIterator begin() const {
+    [[nodiscard]] const_iterator begin() const {
         return keyValList.cbegin();
     }
 
-    [[nodiscard]] ConstIterator cbegin() const {
+    [[nodiscard]] const_iterator cbegin() const {
         return keyValList.cbegin();
     }
 
-    [[nodiscard]] Iterator end() {
+    [[nodiscard]] iterator end() {
         return keyValList.end();
     }
 
-    [[nodiscard]] ConstIterator end() const {
+    [[nodiscard]] const_iterator end() const {
         return keyValList.cend();
     }
 
-    [[nodiscard]] ConstIterator cend() const {
+    [[nodiscard]] const_iterator cend() const {
         return keyValList.cend();
     }
 
-    Iterator find(const Key& key) {
+    iterator find(const Key& key) {
         size_t bucket = getBucket(key);
         if (bucketBegins[bucket] == end())
             return end();
@@ -842,7 +721,7 @@ public:
         return end();
     }
 
-    ConstIterator find(const Key& key) const {
+    const_iterator find(const Key& key) const {
         size_t bucket = getBucket(key);
         if (bucketBegins[bucket] == cend())
             return cend();
@@ -856,20 +735,23 @@ public:
         return cend();
     }
 
-    template<typename NodeType>
-    std::pair<Iterator, bool> insert(NodeType&& node) {
-        KeyValListNode* listNode = keyValList.make(std::forward<NodeType>(node));
+    std::pair<iterator, bool> insert(const KeyValPair& value) {
+        KeyValPair copy(value);
+        return insert(std::move(copy));
+    }
+
+    std::pair<iterator, bool> insert(KeyValPair&& value) {
+        KeyValListNode* listNode = keyValList.make(std::move(value));
         return insertListNode(listNode);
     }
 
-    template<typename NodeType>
-    std::pair<Iterator, bool> insert(const NodeType& node) {
-        KeyValPair copy(node);
-        return insert(node);
+    template<typename P>
+    std::pair<iterator, bool> insert(P&& value) {
+        return emplace(std::forward<P>(value));
     }
 
     template<typename... Args>
-    std::pair<Iterator, bool> emplace(Args&&... args) {
+    std::pair<iterator, bool> emplace(Args&&... args) {
         KeyValListNode* listNode
             = keyValList.make(std::forward<Args>(args)...);
 
@@ -904,7 +786,7 @@ public:
         return it->second;
     }
 
-    Iterator erase(ConstIterator position) {
+    iterator erase(const_iterator position) {
         size_t bucket = getBucket(position->first);
         if (bucketBegins[bucket] == bucketEnds[bucket])
             bucketBegins[bucket] = bucketEnds[bucket] = keyValList.end();
@@ -915,7 +797,7 @@ public:
         return keyValList.erase(position);
     }
 
-    Iterator erase(ConstIterator first, ConstIterator last) {
+    const_iterator erase(const_iterator first, const_iterator last) {
         for (auto it = first; it != last;) {
             auto nextIt =  it;
             ++nextIt;
@@ -927,7 +809,7 @@ public:
 
     [[nodiscard]] size_t max_size() const {
         return std::numeric_limits<std::ptrdiff_t>::max() /
-               (sizeof(KeyValPair) + 2 * sizeof(Iterator)) - 20;
+               (sizeof(KeyValPair) + 2 * sizeof(iterator)) - 20;
     }
 
     [[nodiscard]] double load_factor() const {

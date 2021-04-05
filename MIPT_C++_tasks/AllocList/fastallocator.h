@@ -6,70 +6,72 @@
 #include <chrono>
 #include <list>
 
-namespace Helpers {
+namespace helpers {
 
-    template<typename T, bool isConst>
-    struct ConstHanger {
-        using type = T;
+    template<size_t chunkSize>
+    class FixedAllocator {
+    private:
+        static const size_t POOL_SIZE = 1u << 20;
+
+        std::vector<char*> pools;
+        char* allocPosition;
+        std::vector<char*> freeChunks;
+
+        void addPool() {
+            pools.push_back(new char[POOL_SIZE]);
+            allocPosition = pools.back();
+        }
+
+    public:
+        FixedAllocator() {
+            addPool();
+        }
+
+        ~FixedAllocator() {
+            for (char* it: pools) {
+                delete[] it;
+            }
+        }
+
+        void* allocate() {
+            char* answer;
+
+            if (freeChunks.empty()) {
+                if (allocPosition >= pools.back() + POOL_SIZE)
+                    addPool();
+                answer = allocPosition;
+                allocPosition += chunkSize;
+            } else {
+                answer = freeChunks.back();
+                freeChunks.pop_back();
+            }
+
+            return static_cast<void*>(answer);
+        }
+
+        void deallocate(void* pointer) {
+            char* castPointer = static_cast<char*>(pointer);
+            freeChunks.push_back(castPointer);
+        }
+
+        FixedAllocator(const FixedAllocator& other) = delete;
+
+        FixedAllocator& operator=(const FixedAllocator& other) = delete;
+
     };
 
-    template<typename T>
-    struct ConstHanger<T, true> {
-        using type = const T;
-    };
+    FixedAllocator<8> fixedAlloc8;
+    FixedAllocator<16> fixedAlloc16;
+    FixedAllocator<24> fixedAlloc24;
+    FixedAllocator<32> fixedAlloc32;
+    FixedAllocator<64> fixedAlloc64;
 
-
-} // namespace Helpers
-
-template<size_t chunkSize>
-class FixedAllocator {
-private:
-    char* pool = new char[POOL_SIZE];
-    size_t next = 0;
-
-    static const size_t POOL_SIZE = (1u << 27);
-
-public:
-    FixedAllocator() = default;
-
-    ~FixedAllocator() {
-        delete[] pool;
-    }
-
-    FixedAllocator(const FixedAllocator& other) = delete;
-
-    FixedAllocator& operator=(const FixedAllocator& other) = delete;
-
-    bool isInside(void* pointer) {
-        return pool <= pointer && pointer < pool + POOL_SIZE;
-    }
-
-    void* allocate(size_t neededSize) {
-        // pool size check is missing to increase performance
-        size_t byteNeededSize = neededSize * chunkSize;
-        next += byteNeededSize;
-        return static_cast<void*>(pool + (next - byteNeededSize));
-    }
-
-    void deallocate(void* pointer, size_t count) {  pointer = pointer; count = count;  }
-};
+}
 
 
 template<typename T>
 class FastAllocator {
-
-    template<typename U>
-    friend class FastAllocator;
-
 private:
-    static const size_t CHUNK_SIZE = 1;
-    static const size_t MAX_FIXED_ALLOCATION_SIZE = 128;
-
-    using FixedAlloc = FixedAllocator<CHUNK_SIZE>;
-
-    std::shared_ptr<FixedAlloc> fixedAlloc =
-            std::make_shared<FixedAlloc>();
-
 
 public:
     using value_type = T;
@@ -79,44 +81,57 @@ public:
     ~FastAllocator() = default;
 
     template<typename U>
-    FastAllocator(const FastAllocator<U>& other)
-            :fixedAlloc(other.fixedAlloc)
-    {   }
+    FastAllocator(const FastAllocator<U>& other) {  }
 
-    void swap(FastAllocator& other) {
-        std::swap(fixedAlloc, other.fixedAlloc);
-    }
-
-    FastAllocator& operator=(const FastAllocator& other) {
-        FastAllocator copy(other);
-        swap(copy);
-        return *this;
-    }
-
-    value_type* allocate(size_t count) {
-        size_t neededSize = count * sizeof(T);
-        if (neededSize <= MAX_FIXED_ALLOCATION_SIZE)
-            return reinterpret_cast<T*>(fixedAlloc->allocate(neededSize));
-        return reinterpret_cast<T*>(::operator new(neededSize));
-    }
-
-    void deallocate(value_type* pointer, size_t count) {
-        void* castPointer = reinterpret_cast<void*>(pointer);
-        if (fixedAlloc->isInside(castPointer))
-            fixedAlloc->deallocate(castPointer, count);
-        else
-            ::operator delete(castPointer);
-    }
+    FastAllocator& operator=(const FastAllocator& other) = default;
 
     bool operator==(const FastAllocator& other) const {
-        return fixedAlloc == other.fixedAlloc;
+        return true;
     }
 
     bool operator!=(const FastAllocator& other) const {
         return !(*this == other);
     }
 
+    value_type* allocate(size_t count) {
+        size_t neededSize = count * sizeof(T);
+        void* answer;
+
+        if (neededSize <= 8)
+            answer = helpers::fixedAlloc8.allocate();
+        else if (neededSize <= 16)
+            answer = helpers::fixedAlloc16.allocate();
+        else if (neededSize <= 24)
+            answer = helpers::fixedAlloc24.allocate();
+        else if (neededSize <= 32)
+            answer = helpers::fixedAlloc32.allocate();
+        else if (neededSize <= 64)
+            answer = helpers::fixedAlloc64.allocate();
+        else
+            answer = ::operator new(neededSize);
+
+        return static_cast<T*>(answer);
+    }
+
+    void deallocate(value_type* pointer, size_t count) {
+        size_t deallocSize = count * sizeof(T);
+        if (deallocSize <= 8)
+            helpers::fixedAlloc8.deallocate(pointer);
+        else if (deallocSize <= 16)
+            helpers::fixedAlloc16.deallocate(pointer);
+        else if (deallocSize <= 24)
+            helpers::fixedAlloc24.deallocate(pointer);
+        else if (deallocSize <= 32)
+            helpers::fixedAlloc32.deallocate(pointer);
+        else if (deallocSize <= 64)
+            helpers::fixedAlloc64.deallocate(pointer);
+        else
+            ::operator delete(pointer, deallocSize);
+    }
+
 };
+
+
 
 
 template<typename T, typename Allocator = std::allocator<T>>
@@ -126,16 +141,35 @@ private:
     using AllocTraits = std::allocator_traits<Allocator>;
 
     struct Node {
-        T value;
+        char buffer[sizeof(T)]{};
 
         Node* prev = nullptr;
         Node* next = nullptr;
 
         Node() = default;
 
-        explicit Node(const T& value)
-                :value(value)
-        {   }
+        Node(const Allocator& allocator) {
+            Allocator allocCopy = allocator;
+            AllocTraits::construct(allocCopy, reinterpret_cast<T*>(buffer));
+        }
+
+        Node(const Allocator& allocator, const T& value) {
+            Allocator allocCopy = allocator;
+            AllocTraits::construct(allocCopy, reinterpret_cast<T*>(buffer), value);
+        }
+
+        void destroyValue(const Allocator& allocator) {
+            Allocator allocCopy = allocator;
+            AllocTraits::destroy(allocCopy, reinterpret_cast<T*>(buffer));
+        }
+
+        T& getValue() {
+            return *reinterpret_cast<T*>(buffer);
+        }
+
+        ~Node() = default;
+
+
     };
 
 
@@ -175,7 +209,7 @@ private:
 
     Node* makeAndInsertAfter(Node* node, const T& value) {
         Node* newNode = NodeAllocTraits::allocate(alloc, 1);
-        NodeAllocTraits::construct(alloc, newNode, value);
+        NodeAllocTraits::construct(alloc, newNode, get_allocator(), value);
         insertAfter(node, newNode);
         return newNode;
     }
@@ -192,6 +226,7 @@ private:
 
         Node* returnValue = node->next;
 
+        node->destroyValue(get_allocator());
         NodeAllocTraits::destroy(alloc, node);
         NodeAllocTraits::deallocate(alloc, node, 1);
 
@@ -207,7 +242,7 @@ public:
         friend class ProtoIterator;
 
     private:
-        using ValueT = typename Helpers::template ConstHanger<T, isConst>::type;
+        using ValueT = std::conditional_t<isConst, const T, T>;
 
         Node* node;
         const List* container;
@@ -229,7 +264,7 @@ public:
         {   }
 
         ProtoIterator(const ProtoIterator& other)
-            :node(other.node), container(other.container) {  }
+                :node(other.node), container(other.container) {  }
 
         void swap(ProtoIterator& other) {
             std::swap(node, other.node);
@@ -250,7 +285,7 @@ public:
         ~ProtoIterator() = default;
 
         reference operator*() const {
-            return node->value;
+            return node->getValue();
         }
 
         pointer operator->() const {
@@ -331,11 +366,11 @@ public:
     }
 
     List(size_t count, const Allocator& alloc = Allocator())
-        :List(alloc) {
+            :List(alloc) {
 
         for (size_t i = 0; i < count; ++i) {
             Node* newNode = NodeAllocTraits::allocate(this->alloc, 1);
-            NodeAllocTraits::construct(this->alloc, newNode);
+            NodeAllocTraits::construct(this->alloc, newNode, get_allocator());
             insertAfter(lastNode, newNode);
         }
     }
@@ -430,7 +465,7 @@ public:
 
     List(const List& other)
             :alloc(static_cast<NodeAlloc>(
-                    AllocTraits::select_on_container_copy_construction(static_cast<Allocator>(other.alloc)))) {
+                           AllocTraits::select_on_container_copy_construction(static_cast<Allocator>(other.alloc)))) {
 
         for (const auto& it: other) {
             push_back(it);
